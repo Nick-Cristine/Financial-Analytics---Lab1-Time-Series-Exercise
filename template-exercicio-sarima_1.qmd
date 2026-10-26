@@ -1,0 +1,392 @@
+---
+title: "Exercício: SARIMA no comércio varejista brasileiro — São Paulo"
+author: "Nicole Cristine"
+lang: pt-BR
+format:
+  html:
+    embed-resources: true
+    toc: true
+    code-fold: show
+jupyter: python3
+---
+
+## Sobre o exercício
+
+A base é a **PMC** (Pesquisa Mensal do Comércio) do IBGE: índice de volume de vendas no **comércio varejista ampliado** (inclui veículos e materiais de construção), por **Unidade da Federação**, mensal de jan/2004 em diante. Base 2022 = 100, **sem ajuste sazonal**.
+
+UF de interesse: **São Paulo**.
+
+## Setup
+
+```{python}
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from statsmodels.tsa.stattools import adfuller, kpss
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.stats.diagnostic import acorr_ljungbox
+
+from statsforecast import StatsForecast
+from statsforecast.models import AutoARIMA, ARIMA
+from statsforecast.arima import ndiffs, nsdiffs
+
+import warnings
+warnings.filterwarnings('ignore')
+
+plt.style.use('default')
+plt.rcParams.update({
+    'figure.facecolor':'#FFFFFF','axes.facecolor':'#F9F9F9',
+    'axes.edgecolor':'#BBBBBB','axes.labelcolor':'#1C1C1C',
+    'xtick.color':'#444444','ytick.color':'#444444',
+    'text.color':'#1C1C1C','grid.color': '#DDDDDD',
+    'grid.linestyle':'--','grid.alpha':0.5,'figure.dpi':110,
+})
+RED,BLUE,GREEN,GRAY,YELLOW='#E4002B','#1a6fc4','#1a9b57','#555555','#cc8800'
+```
+
+## Carregando a base PMC
+
+A base já foi pré-processada para conter apenas as colunas relevantes, e já no formato "long" (uma linha por data + UF). O nome da coluna de data é "data", e a coluna de interesse (índice de volume) é "volume_idx". A coluna "uf" indica a Unidade da Federação.
+
+```{python}
+pmc = pd.read_csv("https://github.com/padsInsper/202634-fa/releases/download/data/pmc_volume_uf.csv")
+pmc.head()
+```
+
+## Escolha sua UF
+
+```{python}
+MINHA_UF = "São Paulo"
+
+df_sf = (
+    pmc.query("uf == @MINHA_UF")
+    .rename(columns={"uf": "unique_id", "data": "ds", "volume_idx": "y"})
+    [["unique_id", "ds", "y"]]
+    .reset_index(drop=True)
+)
+df_sf['ds'] = pd.to_datetime(df_sf['ds'])
+
+# Versão indexada por data (mesmo formato do `ibc` usado em aula)
+pmc_sp = df_sf.set_index('ds')[['y']].asfreq('MS')
+
+print(f"✅ PMC {MINHA_UF} carregada!")
+print(f"   Período: {pmc_sp.index[0].date()} → {pmc_sp.index[-1].date()}")
+print(f"   Observações: {len(pmc_sp)}")
+df_sf.head()
+```
+
+## Análise descritiva
+
+### Série em nível e ACF
+
+```{python}
+fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+
+axes[0].plot(pmc_sp.index, pmc_sp['y'], color=RED, lw=1.4)
+axes[0].set_title(f'PMC Varejo Ampliado: {MINHA_UF}')
+axes[0].set_ylabel('Índice de volume (2022 = 100)'); axes[0].grid(True)
+axes[0].axvspan(pd.Timestamp('2015-01-01'), pd.Timestamp('2016-12-01'),
+                alpha=0.1, color='orange', label='Crise 2015-16')
+axes[0].axvspan(pd.Timestamp('2020-01-01'), pd.Timestamp('2021-06-01'),
+                alpha=0.12, color=YELLOW, label='Covid')
+axes[0].legend(fontsize=8)
+
+plot_acf(pmc_sp['y'], ax=axes[1], lags=36, zero=False, title='ACF: PMC SP (nível)')
+axes[1].set_xlabel('Lag (meses)')
+for lag in [12, 24, 36]:
+    axes[1].axvline(lag, color=YELLOW, lw=1, ls=':', alpha=0.7)
+
+plt.tight_layout(); plt.show()
+print("💡 ACF decai lentamente → não-estacionária (tendência)")
+print("💡 Picos nos lags 12, 24, 36 → sazonalidade anual")
+```
+
+### PACF em nível
+
+```{python}
+fig, ax = plt.subplots(figsize=(13, 4))
+plot_pacf(pmc_sp['y'], ax=ax, lags=36, zero=False, title='PACF: PMC SP (nível)')
+ax.set_xlabel('Lag (meses)')
+plt.tight_layout(); plt.show()
+print("💡 PACF com lag 1 alto (≈0,85) e lag 12/13 relevantes → persistência + sazonalidade")
+```
+
+### Decomposição aditiva
+
+```{python}
+decomp = seasonal_decompose(pmc_sp['y'], model='additive', period=12)
+
+fig, axes = plt.subplots(4, 1, figsize=(13, 9), sharex=True)
+for ax, (comp, color, label) in zip(axes, [
+    (decomp.observed,  RED,   'Série Original'),
+    (decomp.trend,     BLUE,  'Tendência'),
+    (decomp.seasonal,  GREEN, 'Sazonalidade (período 12)'),
+    (decomp.resid,     GRAY,  'Resíduo'),
+]):
+    ax.plot(comp, color=color, lw=1.3)
+    ax.set_title(label, pad=2); ax.grid(True)
+    ax.axvspan(pd.Timestamp('2015-01-01'), pd.Timestamp('2016-12-01'),
+               alpha=0.08, color='orange')
+    ax.axvspan(pd.Timestamp('2020-01-01'), pd.Timestamp('2021-06-01'),
+               alpha=0.1, color=YELLOW)
+fig.suptitle(f'Decomposição Aditiva: PMC {MINHA_UF}', fontsize=12, y=1.01)
+plt.tight_layout(); plt.show()
+print("💡 Crise 2015-16 → tendência | Pico de dezembro → sazonalidade | Covid → resíduo")
+```
+
+### Diferenciação
+
+```{python}
+# Defasagem, 1ª diferença e diferença sazonal
+pmc_sp['y_lag1']      = pmc_sp['y'].shift(1)
+pmc_sp['y_diff']      = pmc_sp['y'].diff(1)
+pmc_sp['y_diff12']    = pmc_sp['y'].diff(12)
+pmc_sp['y_diff_seas'] = pmc_sp['y_diff'].diff(12)
+
+fig, axes = plt.subplots(3, 1, figsize=(13, 8), sharex=True)
+for ax, (col, color, label) in zip(axes, [
+    ('y_diff',      BLUE,  '1ª Diferença (Δ)'),
+    ('y_diff12',    GRAY,  'Diferença Sazonal (Δ₁₂)'),
+    ('y_diff_seas', GREEN, '1ª Diferença + Diferença Sazonal (ΔΔ₁₂)'),
+]):
+    ax.plot(pmc_sp.index, pmc_sp[col], color=color, lw=1.2)
+    ax.axhline(0, color='#888', lw=0.8, ls='--')
+    ax.set_title(label); ax.grid(True)
+    ax.axvspan(pd.Timestamp('2020-01-01'), pd.Timestamp('2021-06-01'),
+               alpha=0.1, color=YELLOW)
+plt.tight_layout(); plt.show()
+```
+
+### ACF/PACF das séries diferenciadas
+
+```{python}
+fig, axes = plt.subplots(3, 2, figsize=(13, 10))
+
+for row, (col, nome) in enumerate([
+    ('y_diff',      '1ª Diferença (Δ)'),
+    ('y_diff12',    'Diferença Sazonal (Δ₁₂)'),
+    ('y_diff_seas', 'ΔΔ₁₂'),
+]):
+    plot_acf( pmc_sp[col].dropna(), ax=axes[row, 0], lags=36, zero=False, title=f'ACF: {nome}')
+    plot_pacf(pmc_sp[col].dropna(), ax=axes[row, 1], lags=36, zero=False, title=f'PACF: {nome}')
+    for ax in axes[row]:
+        ax.set_xlabel('Lag (meses)')
+        for lag in [12, 24, 36]:
+            ax.axvline(lag, color=YELLOW, lw=1, ls=':', alpha=0.6)
+
+plt.tight_layout(); plt.show()
+print("💡 Só Δ: picos fortes nos lags 12/24/36 → sazonalidade remanescente → precisa de diff(12)")
+print("💡 Só Δ₁₂: ACF ainda decai devagar → tendência remanescente → precisa de diff(1)")
+print("💡 ΔΔ₁₂: pico negativo no lag 12 → sugere SMA(1), Q=1")
+```
+
+### Série estacionarizada + Dummy Covid
+
+Retiramos os meses do choque da Covid (NaN) para ler a ACF/PACF sem a distorção do outlier.
+
+```{python}
+# Dummy Covid: mar/2020 a ago/2020 como NaN
+pmc_sp['y_est'] = pmc_sp['y_diff_seas']
+covid_idx = pmc_sp.index[pmc_sp.index >= '2020-03-01'][:6]
+pmc_sp.loc[covid_idx, 'y_est'] = np.nan
+print(f"Meses com dummy Covid: {list(covid_idx.strftime('%b/%Y'))}")
+
+serie_est = pmc_sp['y_est'].dropna()
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+plot_acf( serie_est, ax=axes[0], lags=36, zero=False, title='ACF: PMC SP Estacionarizada')
+plot_pacf(serie_est, ax=axes[1], lags=36, zero=False, title='PACF: PMC SP Estacionarizada')
+for ax in axes:
+    ax.set_xlabel('Lag (meses)')
+    ax.axvline(12, color=YELLOW, lw=1, ls=':', alpha=0.7)
+    ax.axvline(24, color=YELLOW, lw=1, ls=':', alpha=0.5)
+plt.tight_layout(); plt.show()
+
+from statsmodels.tsa.stattools import acf as acf_func
+acf_vals = acf_func(serie_est, nlags=36)[1:]
+ci = 1.96/np.sqrt(len(serie_est))
+print(f"ACF lag 1  = {acf_vals[0]:.3f} | ACF lag 12 = {acf_vals[11]:.3f} | IC = ±{ci:.3f}")
+```
+
+## Testes de raiz unitária
+
+### ADF
+
+H₀: a série tem raiz unitária (não estacionária).
+
+```{python}
+def rodar_adf(serie, nome):
+    """Teste ADF com resultado formatado."""
+    serie = serie.dropna()
+    k = int(np.floor((len(serie) - 1) ** (1/3)))
+    res = adfuller(serie, maxlag=k, autolag=None, regression='c')
+    conclusao = "✅ Rejeita H₀ → ESTACIONÁRIA" if res[1] < 0.05 else "⚠️  Não rejeita H₀ → RAIZ UNITÁRIA"
+    print(f"{'='*50}")
+    print(f"ADF: {nome}")
+    print(f"{'='*50}")
+    print(f"  Estatística ADF : {res[0]:.4f}")
+    print(f"  p-value         : {res[1]:.4f}")
+    print(f"  Lags usados     : {res[2]}")
+    print(f"  Valores críticos:")
+    for nivel, valor in res[4].items():
+        print(f"    {nivel}: {valor:.4f}")
+    print(f"  → {conclusao}\n")
+    return res[1]
+
+p1 = rodar_adf(pmc_sp['y'],           'PMC SP, Nível')
+p2 = rodar_adf(pmc_sp['y_diff'],      'PMC SP, 1ª Diferença')
+p3 = rodar_adf(pmc_sp['y_diff12'],    'PMC SP, Diff Sazonal')
+p4 = rodar_adf(pmc_sp['y_diff_seas'], 'PMC SP, Diff + Diff Sazonal')
+```
+
+### KPSS
+
+H₀: a série é estacionária (hipótese invertida em relação ao ADF). O p-valor do KPSS é tabelado entre 0,01 e 0,10: valores nas bordas significam "≤ 0,01" ou "≥ 0,10".
+
+```{python}
+def rodar_kpss(serie, nome):
+    """Teste KPSS com resultado formatado (mesmo formato do rodar_adf)."""
+    serie = serie.dropna()
+    res = kpss(serie, regression='c', nlags='auto')
+    conclusao = "⚠️  Rejeita H₀ → NÃO ESTACIONÁRIA" if res[1] < 0.05 else "✅ Não rejeita H₀ → ESTACIONÁRIA"
+    print(f"{'='*50}")
+    print(f"KPSS: {nome}")
+    print(f"{'='*50}")
+    print(f"  Estatística KPSS: {res[0]:.4f}")
+    print(f"  p-value         : {res[1]:.4f}")
+    print(f"  Lags usados     : {res[2]}")
+    print(f"  Valores críticos:")
+    for nivel, valor in res[3].items():
+        print(f"    {nivel}: {valor:.4f}")
+    print(f"  → {conclusao}\n")
+    return res[1]
+
+k1 = rodar_kpss(pmc_sp['y'],           'PMC SP, Nível')
+k2 = rodar_kpss(pmc_sp['y_diff'],      'PMC SP, 1ª Diferença')
+k3 = rodar_kpss(pmc_sp['y_diff12'],    'PMC SP, Diff Sazonal')
+k4 = rodar_kpss(pmc_sp['y_diff_seas'], 'PMC SP, Diff + Diff Sazonal')
+```
+
+### Resumo e `ndiffs`
+
+```{python}
+resumo = pd.DataFrame({
+    'Série':        ['Nível', 'Δ', 'Δ₁₂', 'ΔΔ₁₂'],
+    'ADF p-value':  [p1, p2, p3, p4],
+    'KPSS p-value': [k1, k2, k3, k4],
+})
+resumo['Estacionária?'] = np.where((resumo['ADF p-value'] < 0.05) & (resumo['KPSS p-value'] > 0.05),
+                                   '✅ Sim', '⚠️ Não')
+print(resumo.round(4).to_string(index=False))
+
+n_d = ndiffs(pmc_sp['y'].values)              # diferenças regulares (teste KPSS)
+n_D = nsdiffs(pmc_sp['y'].values, period=12)  # diferenças sazonais
+print(f"\nndiffs  → d = {n_d} diferença(s) regular(es)")
+print(f"nsdiffs → D = {n_D} diferença(s) sazonal(is)")
+```
+
+## Modelagem
+
+```{python}
+sf = StatsForecast(
+    models=[AutoARIMA(season_length=12)],
+    freq='MS',
+    n_jobs=1,
+)
+sf.fit(df=df_sf)
+
+# Inspecionar modelo selecionado
+modelo = sf.fitted_[0, 0].model_
+arma   = modelo['arma']  # [p, q, P, Q, s, d, D]
+p, q, P, Q, s, d, D = arma
+print(f"✅ Modelo selecionado: SARIMA({p},{d},{q})({P},{D},{Q})[{s}]")
+print(f"   AIC  : {modelo['aic']:.3f}")
+print(f"   AICc : {modelo['aicc']:.3f}")
+print(f"   BIC  : {modelo['bic']:.3f}")
+print(f"   sigma: {modelo['sigma2']**0.5:.4f}")
+print("\nCoeficientes:")
+for nome, valor in modelo['coef'].items():
+    print(f"   {nome:>5}: {valor:.4f}")
+```
+
+## Diagnóstico dos resíduos
+
+```{python}
+residuos = pd.Series(modelo.get('residuals', []), index=pmc_sp.index)
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+axes[0].plot(residuos.index, residuos.values, color=BLUE, lw=0.9, alpha=0.85)
+axes[0].axhline(0, color='#888', ls='--', lw=0.8)
+axes[0].set_title('Resíduos no tempo'); axes[0].grid(True)
+axes[1].hist(residuos, bins=30, color=BLUE, alpha=0.7, edgecolor='#333')
+axes[1].set_title('Distribuição dos resíduos'); axes[1].grid(True, axis='y')
+plot_acf(residuos, ax=axes[2], lags=24, zero=False,
+         title='ACF dos resíduos\n(deve estar no IC → ruído branco)')
+plt.suptitle('Diagnóstico: Resíduos do SARIMA', fontsize=12, y=1.02)
+plt.tight_layout(); plt.show()
+
+lb = acorr_ljungbox(residuos, lags=[12, 24], return_df=True)
+print("Teste Ljung-Box (H₀: resíduos são ruído branco)")
+print(lb.round(4))
+pval = lb['lb_pvalue'].values[-1]
+print("✅ Resíduos são ruído branco!" if pval > 0.05 else "⚠️  Revisar modelo")
+print(f"\nMaior resíduo: {residuos.abs().idxmax():%b/%Y} ({residuos.loc[residuos.abs().idxmax()]:.1f})")
+```
+
+## Previsão · 24 meses à frente
+
+```{python}
+# Previsão 24 meses com IC 80% e 95%
+previsao = sf.predict(h=24, level=[80, 95])
+
+fig, ax = plt.subplots(figsize=(13, 5))
+# Histórico (últimos 6 anos)
+hist = pmc_sp['y'].iloc[-72:]
+ax.plot(hist.index, hist.values, color=RED, lw=1.6, label='PMC SP histórico')
+ax.plot(previsao['ds'], previsao['AutoARIMA'],
+        color=GREEN, lw=2, ls='--', label='Previsão SARIMA (24m)')
+ax.fill_between(previsao['ds'],
+    previsao['AutoARIMA-lo-80'], previsao['AutoARIMA-hi-80'],
+    color=GREEN, alpha=0.30, label='IC 80%')
+ax.fill_between(previsao['ds'],
+    previsao['AutoARIMA-lo-95'], previsao['AutoARIMA-hi-95'],
+    color=GREEN, alpha=0.12, label='IC 95%')
+ax.axvline(pmc_sp.index[-1], color=YELLOW, lw=1.2, ls=':', alpha=0.8)
+ax.text(pmc_sp.index[-1], ax.get_ylim()[0], ' Fim da\namostra',
+        color=YELLOW, fontsize=8, va='bottom')
+ax.set_title(f'AutoARIMA: PMC {MINHA_UF}: Previsão 24 meses com IC')
+ax.set_ylabel('Índice de volume (2022 = 100)')
+ax.legend(fontsize=9); ax.grid(True)
+plt.tight_layout(); plt.show()
+
+amp = previsao['AutoARIMA-hi-95'] - previsao['AutoARIMA-lo-95']
+print(f"Amplitude do IC 95%: {amp.iloc[0]:.1f} pontos (h=1) → {amp.iloc[-1]:.1f} pontos (h=24)")
+```
+
+```{python}
+previsao.round(2)
+```
+
+## Discussão
+
+**1. O ACF/PACF da série original sugeriu sazonalidade? E tendência? Bate com o gráfico de linha?**
+Sim para as duas. A ACF em nível decai devagar (0,85 no lag 1, ainda 0,41 no lag 36), sinal de **tendência**/raiz unitária, e tem "ondas" com picos nos lags 12, 24 e 36, sinal de **sazonalidade anual**. Bate com o gráfico de linha: alta até 2014, queda na crise de 2015–16, recuperação, e picos todo dezembro (Natal) com vale em fevereiro.
+
+**2. Quantas diferenças o AutoARIMA aplicou? E os componentes AR/MA? Deu para ver no ACF/PACF?**
+O AutoARIMA escolheu **SARIMA(2,1,1)(0,1,1)[12]**: **d = 1** e **D = 1**, as mesmas que `ndiffs`/`nsdiffs` sugeriram e que os testes confirmaram. Só ΔΔ₁₂ (assim como Δ) passa no ADF *e* no KPSS; com só Δ₁₂ os testes discordam. Na ACF de ΔΔ₁₂, o pico negativo no lag 12 (≈ −0,39) indica o **SMA(1)** (`sma1` = −0,86), e o pico negativo no lag 1 indica o **MA(1)** (`ma1` = −0,80). O AR(2) é mais difícil de ver a olho, já que AR e MA juntos geram padrões que se misturam. Na prática, o `ar2` ≈ 0, então a parte regular funciona como um ARMA(1,1).
+
+**3. Os resíduos parecem white noise? Algum padrão sazonal remanescente?**
+Sim. O Ljung-Box não rejeita H₀ nos lags 12 (p = 0,16) e 24 (p = 0,32), e a ACF dos resíduos fica dentro do IC, sem pico nos lags 12/24. O ponto fora da curva é **abril/2020** (Covid, resíduo de −24,6), que deixa a distribuição com cauda pesada. Uma melhoria seria incluir uma dummy de intervenção (SARIMAX), como a "dummy Covid" que usamos na aula para ler a ACF.
+
+**4. A previsão pareceu razoável?**
+Sim. Ela captura bem a sazonalidade (pico em dezembro, vale em fevereiro), fica ancorada no nível recente (~100) e segue quase estável, com leve alta. Os intervalos **abrem bastante** com o horizonte (IC 95% vai de ~16 pontos em h = 1 para ~39 pontos em h = 24). Isso é esperado num modelo com d = 1 e D = 1, em que a incerteza se acumula a cada passo.
+
+**5. Que outras UFs dariam um SARIMA bem diferente?**
+São Paulo é uma economia grande e diversificada, com sazonalidade já conhecida. Esperaria modelos diferentes em:
+
+- **UFs pequenas do Norte** (Roraima, Amapá, Acre): séries mais ruidosas e com tendência de crescimento mais forte (migração, obras públicas), possivelmente com mais termos AR/MA.
+- **Estados do agro** (Mato Grosso, Goiás): o varejo ampliado (veículos e materiais de construção) acompanha a safra e a renda agrícola, mudando o formato da sazonalidade.
+- **Estados turísticos do Nordeste**: picos também em julho e no verão, o que pode exigir outra estrutura sazonal (P > 0).
+
